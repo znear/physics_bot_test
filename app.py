@@ -182,7 +182,7 @@ def try_dataframe_select(df_show: pd.DataFrame) -> int | None:
 # STREAMLIT UI
 # =========================
 st.set_page_config(page_title="Physics Bot (QP → MS)", layout="wide")
-st.title("📘 Physics Past Paper Bot (QP → MS → Explain)")
+st.title("📘 Physics Past Paper Bot (QP → MS → Explain) by TAT")
 
 if not os.path.exists(DB_DIR):
     st.error(f"Không thấy folder `{DB_DIR}`. Hãy đặt `physics_db` cùng cấp với app.py.")
@@ -398,3 +398,4 @@ if st.button("Generate explanation"):
     with st.spinner("Generating... (may be slower on CPU)"):
         ans = make_explanation(ms_text, qp_text, keywords, topics, student_note)
     st.markdown(ans)
+
