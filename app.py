@@ -13,6 +13,17 @@ MAPPING_FILE = os.path.join(DB_DIR, "mapping.xlsx")
 PAGES_ARE_1_BASED = True
 MODEL_NAME = "google/flan-t5-small"
 
+# As you specified:
+# m25 = Feb–March 2025
+# s25 = May–June 2025
+# w25 = Oct–Nov 2025
+SERIES_MAP = {
+    "m": "Feb–March",
+    "s": "May–June",
+    "w": "Oct–Nov",
+}
+SERIES_ORDER = {"m": 0, "s": 1, "w": 2}
+
 
 # =========================
 # HELPERS
@@ -25,7 +36,7 @@ def parse_pages(val) -> list[int]:
     """
     Accepts:
       - "2,3,4"
-      - "2-4" (optional)
+      - "2-4"
       - 2
     Returns list of pages in mapping numbering (1-based).
     """
@@ -34,6 +45,7 @@ def parse_pages(val) -> list[int]:
     s = str(val).strip()
     if not s or s.lower() == "nan":
         return []
+
     pages: list[int] = []
     parts = [p.strip() for p in s.split(",") if p.strip()]
     for part in parts:
@@ -45,7 +57,7 @@ def parse_pages(val) -> list[int]:
         else:
             if part.isdigit():
                 pages.append(int(part))
-    # de-duplicate keep order
+
     seen, out = set(), []
     for p in pages:
         if p not in seen:
@@ -144,14 +156,6 @@ def safe_str(x) -> str:
     return "" if s.lower() == "nan" else s
 
 
-def build_all_unique(df: pd.DataFrame, col: str) -> list[str]:
-    s = set()
-    for cell in df[col].tolist():
-        for t in split_tags(cell):
-            s.add(t)
-    return sorted(s)
-
-
 def sort_qid_key(qid: str):
     qid = safe_str(qid).strip()
     m = re.match(r"^[Qq](\d+)", qid)
@@ -159,10 +163,7 @@ def sort_qid_key(qid: str):
 
 
 def try_dataframe_select(df_show: pd.DataFrame) -> int | None:
-    """
-    Try click-to-select row (newer Streamlit).
-    Returns selected row index, or None if not supported.
-    """
+    """Try click-to-select row (newer Streamlit)."""
     try:
         event = st.dataframe(
             df_show,
@@ -178,11 +179,69 @@ def try_dataframe_select(df_show: pd.DataFrame) -> int | None:
         return None
 
 
+# ---- Parse paper_code metadata ----
+# Example: 9702_m25_qp_22
+_paper_re = re.compile(r"^(\d{4})_(?P<series>[msw])(?P<yy>\d{2})_qp_(?P<pv>\d{2})$", re.IGNORECASE)
+
+def parse_paper_meta(paper_code: str):
+    s = safe_str(paper_code).strip()
+    m = _paper_re.match(s)
+    if not m:
+        return None
+    series = m.group("series").lower()  # m/s/w
+    yy = int(m.group("yy"))
+    pv = m.group("pv")  # "22", "41", ...
+    paper_num = int(pv[0])    # 2 or 4
+    variant = int(pv[1])      # 1/2/3
+    year = 2000 + yy
+    return {"series": series, "year": year, "paper": paper_num, "variant": variant}
+
+
+def add_meta_columns(df: pd.DataFrame) -> pd.DataFrame:
+    metas = df["paper_code"].apply(parse_paper_meta)
+    df2 = df.copy()
+    df2["meta_ok"] = metas.notna()
+    df2["paper"] = metas.apply(lambda x: x["paper"] if isinstance(x, dict) else None)
+    df2["year"] = metas.apply(lambda x: x["year"] if isinstance(x, dict) else None)
+    df2["series"] = metas.apply(lambda x: x["series"] if isinstance(x, dict) else None)
+    df2["series_name"] = df2["series"].apply(lambda c: SERIES_MAP.get(c, "") if isinstance(c, str) else "")
+    return df2
+
+
+def build_unique_tags(df: pd.DataFrame) -> list[str]:
+    """Union of keyword + topic tags"""
+    s = set()
+    for cell in df["keywords"].tolist():
+        for t in split_tags(cell):
+            s.add(t)
+    for cell in df["topics"].tolist():
+        for t in split_tags(cell):
+            s.add(t)
+    return sorted(s)
+
+
 # =========================
 # STREAMLIT UI
 # =========================
-st.set_page_config(page_title="Physics Bot (QP → MS)", layout="wide")
-st.title("📘 Physics Past Paper Bot (QP → MS → Explain) by TAT")
+st.set_page_config(
+    page_title="TAT Physics Past Paper Bot",
+    layout="wide"
+)
+
+st.markdown(
+    """
+    <h1 style='text-align: center;'>
+    📘 Physics Past Paper Bot
+    </h1>
+    <h4 style='text-align: center; color: grey;'>
+    Designed & Developed by TAT
+    </h4>
+    """,
+    unsafe_allow_html=True
+)
+
+st.markdown("---")
+
 
 if not os.path.exists(DB_DIR):
     st.error(f"Không thấy folder `{DB_DIR}`. Hãy đặt `physics_db` cùng cấp với app.py.")
@@ -208,23 +267,59 @@ if missing:
 df["paper_code"] = df["paper_code"].astype(str).str.strip()
 df["qid"] = df["qid"].astype(str).str.strip()
 
-mode = st.radio(
-    "Chế độ tìm kiếm",
-    ["Chọn theo paper_code → qid", "Tìm theo Topic (toàn DB)", "Tìm theo Keyword/Topic (toàn DB)"],
-    horizontal=True
-)
+df = add_meta_columns(df)
+df = df[df["meta_ok"] == True].copy()
+
+if df.empty:
+    st.error("Không có paper_code parse được theo format: 9702_m25_qp_22. Hãy kiểm tra paper_code trong mapping.xlsx.")
+    st.stop()
+
+# ONLY 2 options
+main_mode = st.radio("Options", ["Chọn theo paper_code", "Tìm theo keyword/topic"], horizontal=True)
+
+paper_choice = st.radio("Chọn Paper", ["Paper 2 (AS)", "Paper 4 (A Level)"], horizontal=True)
+paper_num = 2 if paper_choice.startswith("Paper 2") else 4
+
+df_p = df[df["paper"] == paper_num].copy()
+if df_p.empty:
+    st.warning(f"Không có dữ liệu cho {paper_choice}.")
+    st.stop()
 
 selected_row = None
 paper_code = None
 
-# -------------------------
-# MODE 1: paper_code -> qid
-# -------------------------
-if mode == "Chọn theo paper_code → qid":
-    paper_codes = sorted(df["paper_code"].unique().tolist())
+# =========================
+# OPTION 1: Choose by paper_code with Year -> Series(code) -> paper_code
+# =========================
+if main_mode == "Chọn theo paper_code":
+    years = sorted(df_p["year"].dropna().unique().tolist())
+    year = st.selectbox("Chọn Year", years, index=len(years) - 1)
+
+    df_y = df_p[df_p["year"] == year].copy()
+
+    series_codes = sorted(
+        df_y["series"].dropna().unique().tolist(),
+        key=lambda x: SERIES_ORDER.get(x, 99)
+    )
+
+    # ✅ FIX: select code directly; display name via format_func
+    series_code = st.selectbox(
+        "Chọn Series",
+        series_codes,
+        index=0,
+        format_func=lambda c: SERIES_MAP.get(c, c)
+    )
+
+    df_s = df_y[df_y["series"] == series_code].copy()
+
+    paper_codes = sorted(df_s["paper_code"].unique().tolist())
+    if not paper_codes:
+        st.warning("Không có paper_code phù hợp với bộ lọc này.")
+        st.stop()
+
     paper_code = st.selectbox("Chọn mã đề (paper_code)", paper_codes, index=0)
 
-    df_paper = df[df["paper_code"] == paper_code].copy()
+    df_paper = df_s[df_s["paper_code"] == paper_code].copy()
     df_paper = df_paper.sort_values(by="qid", key=lambda s: s.map(sort_qid_key))
 
     qid_list = df_paper["qid"].tolist()
@@ -232,83 +327,35 @@ if mode == "Chọn theo paper_code → qid":
 
     selected_row = df_paper[df_paper["qid"] == qid].iloc[0]
 
-# -------------------------
-# MODE 2: Topic across DB
-# -------------------------
-elif mode == "Tìm theo Topic (toàn DB)":
-    all_topics = build_all_unique(df, "topics")
-    if not all_topics:
-        st.warning("Database chưa có topics trong mapping.")
-        st.stop()
-
-    chosen_topic = st.selectbox("Chọn topic", all_topics)
-
-    def has_topic(cell) -> bool:
-        return chosen_topic in split_tags(cell)
-
-    df_result = df[df["topics"].apply(has_topic)].copy()
-    if df_result.empty:
-        st.warning("Không có câu hỏi nào thuộc topic này.")
-        st.stop()
-
-    st.markdown("### Kết quả theo Topic (toàn DB) — click 1 dòng để mở bên dưới")
-    limit_on = st.checkbox("Chỉ hiển thị 200 dòng đầu (đỡ lag)", value=True)
-    df_show = df_result.head(200) if (limit_on and len(df_result) > 200) else df_result
-
-    show_cols = ["paper_code", "qid", "marks", "keywords", "topics", "qp_pages", "ms_pages"]
-    df_show = df_show[show_cols].reset_index(drop=True)
-
-    sel_idx = try_dataframe_select(df_show)
-    if sel_idx is None:
-        df_show["pick_label"] = df_show["paper_code"].astype(str) + " — " + df_show["qid"].astype(str)
-        pick = st.selectbox("Chọn 1 câu để mở QP/MS", df_show["pick_label"].tolist(), index=0)
-        selected_row = df_show[df_show["pick_label"] == pick].iloc[0]
-    else:
-        selected_row = df_show.iloc[int(sel_idx)]
-
-    paper_code = safe_str(selected_row["paper_code"]).strip()
-
-# -------------------------
-# MODE 3: One box filters (tags) across DB
-# -------------------------
+# =========================
+# OPTION 2: Search keyword/topic within selected paper (2 or 4)
+# =========================
 else:
-    all_keywords = build_all_unique(df, "keywords")
-    all_topics = build_all_unique(df, "topics")
+    st.markdown("### Tick tags (keywords + topics)")
 
-    all_tags = sorted(set(all_keywords) | set(all_topics))
-    if not all_tags:
-        st.warning("Database chưa có keywords/topics trong mapping.")
+    tags = build_unique_tags(df_p)
+    if not tags:
+        st.warning("Không có tags trong dataset (keywords/topics trống).")
         st.stop()
 
-    st.markdown("### Tick tags (keywords + topics) trong 1 ô")
-    chosen_tags = st.multiselect("Chọn tags", all_tags, default=[])
-
+    chosen_tags = st.multiselect("Chọn tags", tags, default=[])
     match_mode = st.radio("Match mode (dùng chung)", ["Match ANY (OR)", "Match ALL (AND)"], horizontal=True)
 
     if not chosen_tags:
         st.info("Hãy tick ít nhất 1 tag.")
         st.stop()
 
-    # Determine which chosen tags are keywords / topics (if overlap, it belongs to both)
-    chosen_kw = set([t for t in chosen_tags if t in set(all_keywords)])
-    chosen_tp = set([t for t in chosen_tags if t in set(all_topics)])
+    chosen_set = set(chosen_tags)
 
-    # If user selected tag that appears in neither list (shouldn't happen), ignore it.
-    if not chosen_kw and not chosen_tp:
-        st.info("Các tag bạn tick không khớp keyword/topic trong mapping.")
-        st.stop()
-
-    def match_cell(cell, chosen_set: set[str]) -> bool:
-        if not chosen_set:
-            return True
+    def match_in_cell(cell) -> bool:
         cell_set = set(split_tags(cell))
         if match_mode.startswith("Match ALL"):
             return chosen_set.issubset(cell_set)
         return len(chosen_set.intersection(cell_set)) > 0
 
-    df_result = df.copy()
-    df_result = df_result[df_result["keywords"].apply(lambda x: match_cell(x, chosen_kw))]
-    df_result = df_result[df_result["topics"].apply(lambda x: match_cell(x, chosen_tp))]
+    df_result = df_p[
+        df_p["keywords"].apply(match_in_cell) | df_p["topics"].apply(match_in_cell)
+    ].copy()
 
     if df_result.empty:
         st.warning("Không có câu hỏi nào khớp tags bạn chọn.")
@@ -318,11 +365,12 @@ else:
     limit_on = st.checkbox("Chỉ hiển thị 200 dòng đầu (đỡ lag)", value=True)
     df_show = df_result.head(200) if (limit_on and len(df_result) > 200) else df_result
 
-    show_cols = ["paper_code", "qid", "marks", "keywords", "topics", "qp_pages", "ms_pages"]
+    show_cols = ["paper_code", "year", "series_name", "qid", "marks", "keywords", "topics", "qp_pages", "ms_pages"]
     df_show = df_show[show_cols].reset_index(drop=True)
 
     sel_idx = try_dataframe_select(df_show)
     if sel_idx is None:
+        # fallback
         df_show["pick_label"] = df_show["paper_code"].astype(str) + " — " + df_show["qid"].astype(str)
         pick = st.selectbox("Chọn 1 câu để mở QP/MS", df_show["pick_label"].tolist(), index=0)
         selected_row = df_show[df_show["pick_label"] == pick].iloc[0]
@@ -331,11 +379,14 @@ else:
 
     paper_code = safe_str(selected_row["paper_code"]).strip()
 
-# If paper_code not set (mode 1)
-if paper_code is None:
-    paper_code = safe_str(selected_row["paper_code"]).strip()
+# =========================
+# Render QP/MS
+# =========================
+if selected_row is None:
+    st.stop()
 
-# Build pdf paths
+paper_code = paper_code or safe_str(selected_row["paper_code"]).strip()
+
 qp_pdf = pdf_path_from_code(paper_code)
 ms_code = qp_to_ms_code(paper_code)
 ms_pdf = pdf_path_from_code(ms_code)
@@ -348,15 +399,16 @@ if not os.path.exists(ms_pdf):
     st.error(f"Không thấy file MS: {os.path.basename(ms_pdf)} trong {DB_DIR}")
     st.stop()
 
-# Read row fields
 qid = safe_str(selected_row["qid"]).strip()
 qp_pages = parse_pages(selected_row["qp_pages"])
 ms_pages = parse_pages(selected_row["ms_pages"])
 marks = safe_str(selected_row["marks"])
 keywords = safe_str(selected_row["keywords"])
 topics = safe_str(selected_row["topics"])
+year = safe_str(selected_row.get("year", ""))
+series_name = safe_str(selected_row.get("series_name", ""))
 
-st.caption(f"**{paper_code} — {qid}** | Marks: {marks} | Keywords: {keywords} | Topics: {topics}")
+st.caption(f"**{paper_code} — {qid}** | {series_name} {year} | Marks: {marks} | Keywords: {keywords} | Topics: {topics}")
 
 col1, col2 = st.columns(2)
 
@@ -398,4 +450,3 @@ if st.button("Generate explanation"):
     with st.spinner("Generating... (may be slower on CPU)"):
         ans = make_explanation(ms_text, qp_text, keywords, topics, student_note)
     st.markdown(ans)
-
